@@ -1,3 +1,4 @@
 weights_and_config
 model_flax.pkl
 test_audio
+__pycache__

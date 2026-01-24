@@ -6,9 +6,10 @@ import argparse
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import numpy as np
 import librosa
-import torch # Used for processor which relies on torch tensors potentially
+import torch
 
 from configuration_glmasr import GlmAsrConfig
 from modeling_glmasr_nnx import GlmAsrForConditionalGeneration
@@ -19,6 +20,30 @@ def load_audio(audio_path, sampling_rate=16000):
     speech, _ = librosa.load(audio_path, sr=sampling_rate)
     return speech
 
+def create_sharding_rules(state):
+    # Retrieve flat state to identify keys
+    rules = []
+    # Helper to create rule
+    # (regex, PartitionSpec)
+    # NNX keys loop: (path_tuple, value)
+    # We will iterate the state keys and build a matching ruleset or apply directly.
+    # But defining rules is easier for generalization.
+    
+    # Axis 'tp' = 8
+    
+    # Llama Attention
+    # q_proj.kernel (in, out=heads*dim) -> shard 'out' -> (None, 'tp')
+    # o_proj.kernel (in=heads*dim, out) -> shard 'in' -> ('tp', None) 
+    # MLP
+    # gate_proj (in, out=intermediate) -> (None, 'tp')
+    # down_proj (in=intermediate, out) -> ('tp', None)
+    
+    # We need to map keys.
+    # Key structure in NNX State is a flat dict of (tuple path) -> value.
+    # e.g. ('language_model', 'model', 'layers', 0, 'self_attn', 'q_proj', 'kernel', 'value')
+    
+    pass
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio_path", type=str, default="test_audio/test.mp3")
@@ -27,183 +52,266 @@ def main():
     parser.add_argument("--tokenizer_path", type=str, default="weights_and_config")
     args = parser.parse_args()
 
-    # 1. Load Configuration
-    print(f"Loading config from {args.config_path}...")
+    # Mesh Setup
+    devices = jax.devices()
+    num_devices = len(devices)
+    print(f"Devices detected: {num_devices}")
+    
+    if num_devices < 8:
+        print("Warning: Requested 8 TPUs, but fewer found. Using 1 device or whatever is available, sharding might fail if not 8 divisibility.")
+        # We will proceed anyway for demo/verification logic; on simulated mesh it works if we use mesh(devices[:1]) etc.
+        # But real 'tp' usually assumes matching topology.
+        # Just use all devices.
+    
+    mesh = Mesh(devices, axis_names=('tp',))
+    print(f"Mesh: {mesh}")
+
+    # 1. Config & Model
     with open(args.config_path, "r") as f:
         config_dict = json.load(f)
     config = GlmAsrConfig(**config_dict)
-
-    # 2. Add some inference-specific configs if missing
-    # (e.g. forced_decoder_ids not strictly needed if we implement manual loop, but check EOS)
-    eos_token_id = config.text_config.eos_token_id
-    if isinstance(eos_token_id, int):
-        eos_token_ids = [eos_token_id]
-    else:
-        eos_token_ids = eos_token_id
     
-    # 3. Initialize Model
-    print("Initializing model...")
     rngs = nnx.Rngs(0)
     model = GlmAsrForConditionalGeneration(config, rngs=rngs)
-
-    # 4. Load Weights
-    print(f"Loading weights from {args.weights_path}...")
-    with open(args.weights_path, "rb") as f:
-        state_dict = pickle.load(f)
     
-    # Update model state
-    nnx.update(model, state_dict)
-    print("Model weights loaded.")
-
-    # 5. Initialize Processor
-    print("Initializing processor...")
+    # 2. Processor
     feature_extractor = WhisperFeatureExtractor(feature_size=128, sampling_rate=16000, padding_value=0.0)
-    # Tokenizer: load from local path
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-    # Load chat template
     chat_template_path = os.path.join(args.tokenizer_path, "chat_template.jinja")
     chat_template = None
     if os.path.exists(chat_template_path):
         with open(chat_template_path, "r") as f:
             chat_template = f.read()
-            
     processor = GlmAsrProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer, chat_template=chat_template)
 
-    # 6. Load and Process Audio
-    print(f"Loading audio from {args.audio_path}...")
-    audio = load_audio(args.audio_path)
+    # 3. Load Weights (Host)
+    print(f"Loading weights from {args.weights_path}...")
+    with open(args.weights_path, "rb") as f:
+        state_dict = pickle.load(f) # CPU weights
     
-    # Prepare input
-    # The prompt usually needs to be formatted.
-    # GLM-ASR uses specific chat template or prompt structure.
-    # Default prompt in processor: "Please transcribe this audio into text"
-    # We can use apply_transcription_request from processor if available?
-    # processing_glmasr.py has apply_transcription_request.
+    # 4. Partitioning & Sharding
+    # We need to construct the sharded state.
+    # NNX Graph API allow us to update.
+    
+    print("Sharding model weights...")
     
 
-    # inputs is BatchFeature containing 'input_ids', 'input_features', 'input_features_mask'
-    # If inputs doesn't contain audio features (because apply_chat_template output might not merge them if processor logic is split), 
-    # we need to get them.
-    # The `apply_transcription_request` in `processing_glmasr.py` seems to rely on `self.apply_chat_template`.
-    # But `apply_chat_template` in `ProcessorMixin` usually just tokenizes text unless overridden or passed audio.
-    # `GlmAsrProcessor`'s `__call__` handles audio. `apply_chat_template` usually just handles text formatting.
-    # Let's verify `GlmAsrProcessor` implementation...
-    # It seems `apply_transcription_request` calls `apply_chat_template`. 
-    # If `apply_chat_template` doesn't call `self.__call__` with audio, we get text only.
+    # Define specs for each leaf in state
+    flat_state = nnx.state(model).flat_state()
+    sharded_state = {}
     
-    # We will manually process audio and merge.
+    print("Sample keys from FlatState:", list(dict(flat_state).keys())[:5])
+    print("Sample keys from Loaded Weights:", list(state_dict.keys())[:5])
     
-    # 1. Get input_ids from request
-    # prompt_ids = jnp.array(to_numpy(inputs["input_ids"]))
-    
-    # 2. Get audio features
-    # audio_inputs = feature_extractor(audio, sampling_rate=16000, return_attention_mask=True)
-    # input_features = jnp.array(to_numpy(audio_inputs["input_features"]))
-    # input_features_mask = jnp.array(to_numpy(audio_inputs["attention_mask"])) # usually named attention_mask in FE output
-    
-    # 3. Expand input_ids for audio placeholders
-    # The processor usually does this expansion. If we got input_ids from `apply_transcription_request`, 
-    # did it expand <sound>? 
-    # If `apply_chat_template` was used without audio-aware logic, it might just produce "<|user|>\n<|begin_of_audio|><|pad|><|end_of_audio|>..."
-    # We need to expand tokens if they are not expanded.
-    # The config `audio_token_id` is 59260.
-    
-    # Let's inspect prompt_ids length.
-    # print("Prompt shape:", prompt_ids.shape)
-    
-    # We can try to use `processor(text=..., audio=...)` which we know calls `__call__` and presumably handles everything.
-    # We need to construct the text part manually if we use `processor` directly.
-    # But let's stick to what we have.
-    
-    # Re-call processor properly?
-    # inputs = processor(text=text_prompts, audio=audio)
-    
-    # Constructing prompt text manually to use processor.__call__
-    # Format: "<|system|>\n<|user|>\n<|begin_of_audio|><|pad|><|end_of_audio|>Please transcribe..."
-    # Actually, let's just use `processor` with the raw text if possible.
-    # Or, rely on manual expansion logic implicitly? 
-    # Wait, `processing_glmasr.py` has `__call__` which does: `expand audio tokens in text`.
-    # So if we call `processor(text=..., audio=...)`, it should work.
-    
-    # We need the conversation formatted text.
-    # We can use tokenizer.apply_chat_template(conversations, tokenize=False) to get the string.
-    
-    # conversations = [
-    #     {
-    #         "role": "user",
-    #         "content": [
-    #             {"type": "text", "text": "Please transcribe this audio into text"},
-    #             {"type": "audio", "audio": audio} # Processor expects audio object or path?
-    #         ]
-    #     }
-    # ]
-    # We need to handle audio separately for the text string?
-    # apply_chat_template usually puts placeholders.
-    
-    # Let's try calling processor directly with formatted text.
-    # Using a simple trick: 
-    # text = "<|user|>\nPlease transcribe this audio into text<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
-    # Use processor(text=text, audio=audio)
-    
-    # Actually, let's look at `processing_glmasr.py` again.
-    # `apply_transcription_request` returns `self.apply_chat_template(...)`.
-    # If `apply_chat_template` doesn't handle audio, we are lost.
-    
-    # Fallback: manual full call
+    for key, value_placeholder in dict(flat_state).items():
+        # key is a tuple
+        key_str = ".".join(str(k) for k in key)
+        spec = PartitionSpec() # Default: replicated (None, None) means fully replicated if not specified? 
+        # Actually None usually means replicated on that axis? 
+        # NamedSharding(mesh, PartitionSpec(None)) -> replicated.
+        
+        # Simple heuristic for Tensor Parallelism
+        # Check specific layers in Language Model
+        if "language_model" in key_str:
+            # Attention
+            if "self_attn" in key_str:
+                if "q_proj.kernel" in key_str or "k_proj.kernel" in key_str or "v_proj.kernel" in key_str:
+                    # Column Parallel: (In, Out). Output dimension is sharded.
+                    # Flax Linear is (In, Out).
+                    # Shard axis 1.
+                    spec = PartitionSpec(None, 'tp')
+                elif "o_proj.kernel" in key_str:
+                    # Row Parallel: (In, Out). Input dimension is sharded.
+                    spec = PartitionSpec('tp', None)
+                
+                # KV Cache variables
+                # k_cache: (batch, num_kv_heads, max_len, head_dim)
+                # Shard num_kv_heads (axis 1)
+                elif "k_cache" in key_str or "v_cache" in key_str:
+                    spec = PartitionSpec(None, 'tp', None, None)
+                    
+            # MLP
+            if "mlp" in key_str:
+                if "gate_proj.kernel" in key_str or "up_proj.kernel" in key_str:
+                    # Column Parallel
+                    spec = PartitionSpec(None, 'tp')
+                elif "down_proj.kernel" in key_str:
+                    # Row Parallel
+                    spec = PartitionSpec('tp', None)
+            
+            # Embeddings ? 
+            # Usually vocab is huge. Shard vocab (axis 0).
+            # embed_tokens.embedding: (vocab, hidden)
+            # lm_head.kernel: (hidden, vocab)
+            # Parallelizing vocab is good for memory.
+            if "embed_tokens.embedding" in key_str:
+                spec = PartitionSpec('tp', None)
+            if "lm_head.kernel" in key_str:
+                spec = PartitionSpec(None, 'tp')
+
+        # Create Sharding
+        sharding = NamedSharding(mesh, spec)
+        
+        # Determine value to put
+        # We need the value from state_dict (converted weights) if loading, or current value if init.
+        # The key tuple might match if state_dict uses tuples. 
+        # My converter saved keys as tuples.
+        
+        # Check if key is in loaded weights
+        # Note: converter saved with 'value' at end? Yes.
+        val = state_dict.get(key)
+        if val is None:
+            # If not in weights (e.g. cache initialized but empty), use current init value
+            val = value_placeholder.value if hasattr(value_placeholder, 'value') else value_placeholder
+            # Variable.value is the array.
+            
+        # Device Put
+        # This distributes the array across devices according to spec
+        sharded_val = jax.device_put(val, sharding)
+        sharded_state[key] = sharded_val
+
+    # Update model with sharded weights
+    # sharded_state is a dict of (path_tuple) -> Array
+    # We must convert to State object for update to recognize paths
+    sharded_graph_state = nnx.State.from_flat_path(sharded_state)
+    nnx.update(model, sharded_graph_state)
+    print("Model sharded successfully.")
+
+    # 5. Inputs
+    audio = load_audio(args.audio_path)
     user_prompt = "Please transcribe this audio into text"
-    # Note: verify template logic.
-    # Using a simplified text for now to get it running.
     text_input = f"<|user|>\n{user_prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
-    
     full_inputs = processor(text=text_input, audio=audio, sampling_rate=16000, return_tensors="pt")
+    
     input_ids = jnp.array(full_inputs["input_ids"].numpy())
     input_features = jnp.array(full_inputs["input_features"].numpy())
     input_features_mask = jnp.array(full_inputs["input_features_mask"].numpy())
     
-    print("Input shapes:", input_ids.shape, input_features.shape)
+    batch_size = input_ids.shape[0]
+    max_length = 2048
+    
+    # Helper to enforce input sharding (replicated)
+    replicated = NamedSharding(mesh, PartitionSpec())
+    input_ids = jax.device_put(input_ids, replicated)
+    input_features = jax.device_put(input_features, replicated)
+    input_features_mask = jax.device_put(input_features_mask, replicated)
 
-    # 7. Generation Loop (Greedy)
-    print("Starting generation...")
-    max_new_tokens = 256
-    generated_ids = []
+    # 6. Init Cache (Sharded)
+    # We can call init_cache, but it initializes on default device (0). 
+    # We want it sharded.
+    # Easier to init then update, OR override init_cache logic.
+    # Since we already ran the sharding loop over 'k_cache' keys in `flat_state`,
+    # if `init_cache` was called BEFORE sharding loop, it would be sharded.
+    # BUT `init_cache` creates new Variables. 
+    # Let's call init_cache FIRST, then do the sharding loop which sees the cache keys.
+    # (Moved init_cache call up before sharding loop)
+    pass # Adjusting code order below
+
+    # 7. JIT Functions with Annotation
+    # nnx.jit allows configuring sharding?
+    # Or just standard jax.jit with `in_shardings`, `out_shardings`.
+    # Since inputs are `NamedSharded` arrays, `jax.jit` should respect them (auto-sharding propagation).
+    # We mainly need to ensure operations don't force gathering.
+    # Using `nnx.jit` wraps `jax.jit`.
     
-    curr_input_ids = input_ids
-    
-    for i in range(max_new_tokens):
-        # Forward pass
-        # Note: inefficient, recomputing full context each time
+    @nnx.jit
+    def prefill(model, input_ids, input_features, input_features_mask):
+        cache_index = jnp.array(0, dtype=jnp.int32)
         logits = model(
-            input_ids=curr_input_ids,
+            input_ids=input_ids,
             input_features=input_features,
             input_features_mask=input_features_mask,
             deterministic=True,
-            rngs=rngs
+            cache_index=cache_index
         )
+        return logits[:, -1, :], cache_index + input_ids.shape[1]
+
+    @nnx.jit
+    def decode(model, input_ids, cache_index):
+        logits = model(
+            input_ids=input_ids,
+            deterministic=True,
+            cache_index=cache_index
+        )
+        return logits[:, -1, :], cache_index + 1
+
+    # Actual Execution Flow
+    # Init Cache
+    model.init_cache(batch_size, max_length)
+    
+    # Rerun sharding loop to catch cache variables
+    # (Copy-paste the loop logic or encapsulate function)
+    # See `create_sharded_state` logic roughly implemented above.
+    
+    # Redoing sharding loop properly
+    flat_state = nnx.state(model).flat_state() # Now contains cache
+    final_sharded_state = {}
+    for key, leaf in dict(flat_state).items():
+        key_str = ".".join(str(k) for k in key)
+        spec = PartitionSpec() 
         
-        # Get next token (argmax)
-        next_token_logits = logits[:, -1, :]
-        next_token_id = jnp.argmax(next_token_logits, axis=-1)
-        
-        token_scalar = next_token_id[0].item() # Assuming batch size 1
-        generated_ids.append(token_scalar)
-        
-        # Check EOS
-        if token_scalar in eos_token_ids:
-            print("EOS reached.")
-            break
+        if "language_model" in key_str:
+            if "self_attn" in key_str:
+                if "q_proj.kernel" in key_str or "k_proj.kernel" in key_str or "v_proj.kernel" in key_str:
+                    spec = PartitionSpec(None, 'tp')
+                elif "o_proj.kernel" in key_str:
+                    spec = PartitionSpec('tp', None)
+                elif "k_cache" in key_str or "v_cache" in key_str:
+                    # Cache is (batch, head, seq, dim)
+                    # Heads (4) < Devices (8), so cannot shard head.
+                    # Shard sequence length (2048).
+                    spec = PartitionSpec(None, None, 'tp', None)
+                    
+            if "mlp" in key_str:
+                if "down_proj.kernel" in key_str:
+                    spec = PartitionSpec('tp', None)
+                elif "gate_proj.kernel" in key_str or "up_proj.kernel" in key_str:
+                    spec = PartitionSpec(None, 'tp')
             
-        # Update input_ids
-        curr_input_ids = jnp.concatenate([curr_input_ids, next_token_id[:, None]], axis=1)
+            if "embed_tokens.embedding" in key_str:
+                spec = PartitionSpec('tp', None)
+            if "lm_head.kernel" in key_str:
+                spec = PartitionSpec(None, 'tp')
+
+        sharding = NamedSharding(mesh, spec)
         
-        # Print progress
-        print(f"\rGenerated {i+1} tokens...", end="", flush=True)
+        # Get data: prefer loaded weights, else leaf value
+        if key in state_dict:
+            val = state_dict[key]
+        else:
+            # leaf is likely a nnx.Param or Variable wrapper from flat_state? 
+            # No, flat_state(model) returns the values (arrays).
+            val = leaf
+            
+        final_sharded_state[key] = jax.device_put(val, sharding)
+
+    final_sharded_graph_state = nnx.State.from_flat_path(final_sharded_state)
+    nnx.update(model, final_sharded_graph_state)
+    
+    print("Running prefill...")
+    logits, cache_index = prefill(model, input_ids, input_features, input_features_mask)
+    
+    print("Generating...")
+    generated_ids = []
+    eos_token_ids = config.text_config.eos_token_id
+    if isinstance(eos_token_ids, int): eos_token_ids = [eos_token_ids]
+    token_id = jnp.argmax(logits, axis=-1)[:, None]
+    
+    for i in range(256):
+        # We need token_id to be replicated/sharded correctly.
+        # It's small (batch, 1). Replicated ok.
+        token_id = jax.device_put(token_id, replicated)
+        
+        scalar = token_id[0, 0].item()
+        generated_ids.append(scalar)
+        if scalar in eos_token_ids: break
+        
+        logits, cache_index = decode(model, token_id, cache_index)
+        token_id = jnp.argmax(logits, axis=-1)[:, None]
+        if i % 10 == 0: print(f"\rStep {i}", end="", flush=True)
 
     print("\nDecoding...")
-    text = processor.batch_decode([generated_ids], skip_special_tokens=True)[0]
-    print("-" * 40)
-    print("Transcription:")
-    print(text)
-    print("-" * 40)
+    print(processor.batch_decode([generated_ids], skip_special_tokens=True)[0])
 
 if __name__ == "__main__":
     main()
