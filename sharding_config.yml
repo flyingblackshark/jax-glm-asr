@@ -1,16 +1,11 @@
 logical_axis_rules: [
                       ['batch', 'data'],
                       ['activation_batch', 'data'],
-                      ['activation_length', 'fsdp'],
-                      
                       ['activation_heads', 'tensor'],
                       ['mlp','tensor'],
-                      ['embed','fsdp'],
                       ['heads', 'tensor'],
-                      ['norm', 'tensor'],
-                      ['conv_batch', ['data','fsdp']],
-                      ['out_channels', 'tensor'],
-                      ['conv_out', 'fsdp'],
+                      ['vocab', 'tensor'],
+                      ['out_channels', 'tensor']
                     ]
 
-data_sharding: [['data', 'fsdp', 'tensor']]
+data_sharding: [['data', 'tensor']]
