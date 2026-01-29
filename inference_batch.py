@@ -2,7 +2,6 @@ import argparse
 import csv
 import json
 import os
-import pickle
 import sys
 from pathlib import Path
 
@@ -22,7 +21,6 @@ except ImportError as e:
 from configuration_glmasr import GlmAsrConfig
 from convert_glmasr_weights_to_nnx import convert_pytorch_state_dict_to_nnx_state_dict
 from inference_nnx import load_audio, load_feature_extractor, load_tokenizer, shard_model
-from hf_in_memory import hf_read_bytes, hf_read_json
 from modeling_glmasr_nnx import GlmAsrForConditionalGeneration
 from processing_glmasr import GlmAsrProcessor
 from transformers.utils.hub import cached_file
@@ -125,18 +123,13 @@ def load_config(args) -> GlmAsrConfig:
         with open(args.config_path, "r") as f:
             config_dict = json.load(f)
         return GlmAsrConfig(**config_dict)
-    config_dict = hf_read_json(args.model_id, "config.json", revision=args.revision)
-    return GlmAsrConfig(**config_dict)
+    return GlmAsrConfig.from_pretrained(args.model_id, revision=args.revision)
 
 
 def load_nnx_state_dict(args, config: GlmAsrConfig):
     state_dict = None
     if args.weights_path and os.path.exists(args.weights_path):
-        if args.weights_path.endswith(".pkl"):
-            print(f"Loading NNX weights from {args.weights_path}...")
-            with open(args.weights_path, "rb") as f:
-                state_dict = pickle.load(f)
-        elif args.weights_path.endswith(".safetensors"):
+        if args.weights_path.endswith(".safetensors"):
             from safetensors.torch import load_file
 
             print(f"Loading safetensors weights from {args.weights_path}...")
@@ -146,19 +139,13 @@ def load_nnx_state_dict(args, config: GlmAsrConfig):
         else:
             raise ValueError(f"Unsupported --weights_path format: {args.weights_path}")
     else:
-        from safetensors.torch import load as load_safetensors
+        from safetensors.torch import load_file
 
-        print(f"Downloading weights (in-memory) from {args.model_id}...")
-        weights_bytes = hf_read_bytes(args.model_id, "model.safetensors", revision=args.revision)
-        pt_state_dict = load_safetensors(weights_bytes)
-        del weights_bytes
+        print(f"Downloading weights via HF cache from {args.model_id}...")
+        model_path = cached_file(args.model_id, "model.safetensors", revision=args.revision)
+        pt_state_dict = load_file(model_path)
         print("Converting weights to NNX format...")
         state_dict = convert_pytorch_state_dict_to_nnx_state_dict(pt_state_dict, config, verbose=True)
-
-        if args.weights_path and args.weights_path.endswith(".pkl"):
-            print(f"Saving converted NNX weights to {args.weights_path}...")
-            with open(args.weights_path, "wb") as f:
-                pickle.dump(state_dict, f)
     return state_dict
 
 
@@ -171,7 +158,7 @@ def build_processor(args) -> GlmAsrProcessor:
     tokenizer = load_tokenizer(tokenizer_source, args.revision)
 
     chat_template = getattr(tokenizer, "chat_template", None)
-    if chat_template is None:
+    if not chat_template:
         try:
             chat_template_file = cached_file(tokenizer_source, "chat_template.jinja", revision=args.revision)
             with open(chat_template_file, "r") as f:
@@ -207,9 +194,36 @@ def transcribe_batch(
         padded_paths.extend([audio_paths[-1]] * (pad_to - batch_size))
 
     audios = [load_audio(p) for p in padded_paths]
-    text_inputs = [
-        f"<|user|>\n{prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>" for _ in range(len(padded_paths))
-    ]
+    if processor.chat_template:
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": ""},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            text_inputs = [
+                processor.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    chat_template=processor.chat_template,
+                )
+                for _ in range(len(padded_paths))
+            ]
+        except Exception:
+            text_inputs = [
+                f"<|user|>\n{prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
+                for _ in range(len(padded_paths))
+            ]
+    else:
+        text_inputs = [
+            f"<|user|>\n{prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
+            for _ in range(len(padded_paths))
+        ]
     full_inputs = processor(text=text_inputs, audio=audios, sampling_rate=16000, return_tensors="pt")
 
     if full_inputs["input_ids"].shape[0] != pad_to:
@@ -281,9 +295,9 @@ def main():
     parser.add_argument("--input_path", type=str, required=True, help="Audio file or directory to scan recursively.")
     parser.add_argument("--output_csv", type=str, default="transcripts.csv", help="Output CSV path.")
 
-    parser.add_argument("--weights_path", type=str, default=None, help="Optional local .pkl/.safetensors weights path. If omitted, load from HF in-memory.")
-    parser.add_argument("--config_path", type=str, default=None, help="Optional local config.json path. If omitted, load from HF in-memory.")
-    parser.add_argument("--tokenizer_path", type=str, default=None, help="Optional local tokenizer directory. If omitted, load from HF (may use HF cache).")
+    parser.add_argument("--weights_path", type=str, default=None, help="Optional local .safetensors weights path. If omitted, download via HF cache.")
+    parser.add_argument("--config_path", type=str, default=None, help="Optional local config.json path. If omitted, download via HF cache.")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Optional local tokenizer directory. If omitted, load from HF (uses HF cache).")
     parser.add_argument("--model_id", type=str, default="zai-org/GLM-ASR-Nano-2512")
     parser.add_argument("--revision", type=str, default=None)
 

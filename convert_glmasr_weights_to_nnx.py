@@ -7,84 +7,73 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from safetensors.torch import load as load_safetensors
 from safetensors.torch import load_file
 from flax import nnx
 
 from configuration_glmasr import GlmAsrConfig
 from modeling_glmasr_nnx import GlmAsrForConditionalGeneration
-from hf_in_memory import hf_read_bytes, hf_read_json
+from transformers.utils.hub import cached_file
 
-# Mapping from original PyTorch GLM-ASR (from HF Hub) to our Flax NNX implementation
-
+# Mapping from HuggingFace PyTorch `model.safetensors` keys -> NNX model key strings.
+# The upstream checkpoint already uses high-level module names like `audio_tower.*` / `language_model.*`.
 MAPPING = {
-    # PyTorch checkpoint key -> NNX model key
-    # Source format: audio_encoder.whisper.* -> Target: audio_tower.*
-    # Source format: model.* -> Target: language_model.model.*
-    # Source format: lm_head.* -> Target: language_model.lm_head.*
-    
     # =============
-    # Audio Encoder (Whisper-like)
+    # Audio Encoder
     # =============
-    # Conv layers
-    r"^audio_encoder\.whisper\.conv1\.weight$":         r"audio_tower.conv1.kernel",
-    r"^audio_encoder\.whisper\.conv1\.bias$":           r"audio_tower.conv1.bias",
-    r"^audio_encoder\.whisper\.conv2\.weight$":         r"audio_tower.conv2.kernel",
-    r"^audio_encoder\.whisper\.conv2\.bias$":           r"audio_tower.conv2.bias",
-    
-    # Encoder layers - Attention
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.q_proj\.weight$":     r"audio_tower.layers[\1].self_attn.q_proj.kernel",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.q_proj\.bias$":       r"audio_tower.layers[\1].self_attn.q_proj.bias",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.k_proj\.weight$":     r"audio_tower.layers[\1].self_attn.k_proj.kernel",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.v_proj\.weight$":     r"audio_tower.layers[\1].self_attn.v_proj.kernel",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.v_proj\.bias$":       r"audio_tower.layers[\1].self_attn.v_proj.bias",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.out_proj\.weight$":   r"audio_tower.layers[\1].self_attn.o_proj.kernel",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn\.out_proj\.bias$":     r"audio_tower.layers[\1].self_attn.o_proj.bias",
-    
-    # Layer norms (Whisper uses self_attn_layer_norm -> our input_layernorm, final_layer_norm -> post_attention_layernorm)
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn_layer_norm\.weight$":  r"audio_tower.layers[\1].input_layernorm.scale",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.self_attn_layer_norm\.bias$":    r"audio_tower.layers[\1].input_layernorm.bias",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.final_layer_norm\.weight$":      r"audio_tower.layers[\1].post_attention_layernorm.scale",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.final_layer_norm\.bias$":        r"audio_tower.layers[\1].post_attention_layernorm.bias",
-    
-    # MLP (Whisper uses fc1/fc2)
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.fc1\.weight$":    r"audio_tower.layers[\1].mlp.fc1.kernel",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.fc1\.bias$":      r"audio_tower.layers[\1].mlp.fc1.bias",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.fc2\.weight$":    r"audio_tower.layers[\1].mlp.fc2.kernel",
-    r"^audio_encoder\.whisper\.layers\.(\d+)\.fc2\.bias$":      r"audio_tower.layers[\1].mlp.fc2.bias",
-    
-    # Audio encoder extras
-    r"^audio_encoder\.layer_norm\.weight$":  r"audio_tower.norm.scale",
-    r"^audio_encoder\.layer_norm\.bias$":    r"audio_tower.norm.bias",
-    
-    # Multi-modal projector uses audio_encoder.adapting (5120->4096->2048)
-    r"^audio_encoder\.adapting\.0\.weight$":  r"multi_modal_projector.linear_1.kernel",
-    r"^audio_encoder\.adapting\.0\.bias$":    r"multi_modal_projector.linear_1.bias",
-    r"^audio_encoder\.adapting\.2\.weight$":  r"multi_modal_projector.linear_2.kernel",
-    r"^audio_encoder\.adapting\.2\.bias$":    r"multi_modal_projector.linear_2.bias",
+    r"^audio_tower\.conv1\.weight$": r"audio_tower.conv1.kernel",
+    r"^audio_tower\.conv1\.bias$": r"audio_tower.conv1.bias",
+    r"^audio_tower\.conv2\.weight$": r"audio_tower.conv2.kernel",
+    r"^audio_tower\.conv2\.bias$": r"audio_tower.conv2.bias",
 
-    
+    # Layer norms (PyTorch weight/bias -> Flax LayerNorm scale/bias)
+    r"^audio_tower\.layers\.(\d+)\.input_layernorm\.weight$": r"audio_tower.layers[\1].input_layernorm.scale",
+    r"^audio_tower\.layers\.(\d+)\.input_layernorm\.bias$": r"audio_tower.layers[\1].input_layernorm.bias",
+    r"^audio_tower\.layers\.(\d+)\.post_attention_layernorm\.weight$": r"audio_tower.layers[\1].post_attention_layernorm.scale",
+    r"^audio_tower\.layers\.(\d+)\.post_attention_layernorm\.bias$": r"audio_tower.layers[\1].post_attention_layernorm.bias",
+    r"^audio_tower\.norm\.weight$": r"audio_tower.norm.scale",
+    r"^audio_tower\.norm\.bias$": r"audio_tower.norm.bias",
+
+    # Audio attention
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.weight$": r"audio_tower.layers[\1].self_attn.q_proj.kernel",
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.bias$": r"audio_tower.layers[\1].self_attn.q_proj.bias",
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.k_proj\.weight$": r"audio_tower.layers[\1].self_attn.k_proj.kernel",
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.weight$": r"audio_tower.layers[\1].self_attn.v_proj.kernel",
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.bias$": r"audio_tower.layers[\1].self_attn.v_proj.bias",
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.o_proj\.weight$": r"audio_tower.layers[\1].self_attn.o_proj.kernel",
+    r"^audio_tower\.layers\.(\d+)\.self_attn\.o_proj\.bias$": r"audio_tower.layers[\1].self_attn.o_proj.bias",
+
+    # Audio MLP
+    r"^audio_tower\.layers\.(\d+)\.mlp\.fc1\.weight$": r"audio_tower.layers[\1].mlp.fc1.kernel",
+    r"^audio_tower\.layers\.(\d+)\.mlp\.fc1\.bias$": r"audio_tower.layers[\1].mlp.fc1.bias",
+    r"^audio_tower\.layers\.(\d+)\.mlp\.fc2\.weight$": r"audio_tower.layers[\1].mlp.fc2.kernel",
+    r"^audio_tower\.layers\.(\d+)\.mlp\.fc2\.bias$": r"audio_tower.layers[\1].mlp.fc2.bias",
+
     # =============
-    # Language Model (Llama-like)
+    # Multi-modal projector
     # =============
-    r"^model\.embed_tokens\.weight$":        r"language_model.model.embed_tokens.embedding",
-    r"^model\.norm\.weight$":                r"language_model.model.norm.weight",
-    r"^lm_head\.weight$":                    r"language_model.lm_head.kernel",
-    
-    # Layers - Attention
-    r"^model\.layers\.(\d+)\.self_attn\.q_proj\.weight$":  r"language_model.model.layers[\1].self_attn.q_proj.kernel",
-    r"^model\.layers\.(\d+)\.self_attn\.k_proj\.weight$":  r"language_model.model.layers[\1].self_attn.k_proj.kernel",
-    r"^model\.layers\.(\d+)\.self_attn\.v_proj\.weight$":  r"language_model.model.layers[\1].self_attn.v_proj.kernel",
-    r"^model\.layers\.(\d+)\.self_attn\.o_proj\.weight$":  r"language_model.model.layers[\1].self_attn.o_proj.kernel",
-    
-    # Layer norms
-    r"^model\.layers\.(\d+)\.input_layernorm\.weight$":          r"language_model.model.layers[\1].input_layernorm.weight",
-    r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$": r"language_model.model.layers[\1].post_attention_layernorm.weight",
-    
-    # MLP (Llama uses gate_proj/up_proj/down_proj)
-    r"^model\.layers\.(\d+)\.mlp\.gate_proj\.weight$":  r"language_model.model.layers[\1].mlp.gate_proj.kernel",
-    r"^model\.layers\.(\d+)\.mlp\.up_proj\.weight$":    r"language_model.model.layers[\1].mlp.up_proj.kernel",
-    r"^model\.layers\.(\d+)\.mlp\.down_proj\.weight$":  r"language_model.model.layers[\1].mlp.down_proj.kernel",
+    r"^multi_modal_projector\.linear_1\.weight$": r"multi_modal_projector.linear_1.kernel",
+    r"^multi_modal_projector\.linear_1\.bias$": r"multi_modal_projector.linear_1.bias",
+    r"^multi_modal_projector\.linear_2\.weight$": r"multi_modal_projector.linear_2.kernel",
+    r"^multi_modal_projector\.linear_2\.bias$": r"multi_modal_projector.linear_2.bias",
+
+    # =============
+    # Language model (Llama-like)
+    # =============
+    r"^language_model\.model\.embed_tokens\.weight$": r"language_model.model.embed_tokens.embedding",
+    r"^language_model\.model\.norm\.weight$": r"language_model.model.norm.weight",
+    r"^language_model\.lm_head\.weight$": r"language_model.lm_head.kernel",
+
+    r"^language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight$": r"language_model.model.layers[\1].self_attn.q_proj.kernel",
+    r"^language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight$": r"language_model.model.layers[\1].self_attn.k_proj.kernel",
+    r"^language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight$": r"language_model.model.layers[\1].self_attn.v_proj.kernel",
+    r"^language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight$": r"language_model.model.layers[\1].self_attn.o_proj.kernel",
+
+    r"^language_model\.model\.layers\.(\d+)\.input_layernorm\.weight$": r"language_model.model.layers[\1].input_layernorm.weight",
+    r"^language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight$": r"language_model.model.layers[\1].post_attention_layernorm.weight",
+
+    r"^language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight$": r"language_model.model.layers[\1].mlp.gate_proj.kernel",
+    r"^language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight$": r"language_model.model.layers[\1].mlp.up_proj.kernel",
+    r"^language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight$": r"language_model.model.layers[\1].mlp.down_proj.kernel",
 }
 
 
@@ -140,15 +129,26 @@ def key_str_to_nnx_tuple_path(key_str: str) -> tuple:
             parts.append(part)
     return tuple(parts)
 
-def convert_pytorch_state_dict_to_nnx_state_dict(state_dict, config, *, verbose: bool = False):
+def convert_pytorch_state_dict_to_nnx_state_dict(
+    state_dict,
+    config,
+    *,
+    verbose: bool = False,
+    audio_rope_permute: bool = False,
+):
     new_state = {}
     for k, v in state_dict.items():
         new_key_str = convert_key(k, MAPPING)
         if new_key_str is None:
             continue
 
-        # RoPE permutation for Audio Tower (apply before transpose)
-        if "audio_encoder.whisper" in k and ("q_proj" in k or "k_proj" in k):
+        # RoPE permutation for Audio Tower (apply before transpose).
+        # NOTE: For `zai-org/GLM-ASR-Nano-2512`, the checkpoint matches our RoPE layout and does NOT need permutation.
+        if (
+            audio_rope_permute
+            and k.startswith("audio_tower.layers.")
+            and (".self_attn.q_proj.weight" in k or ".self_attn.k_proj.weight" in k)
+        ):
             v = permute_rope_torch(v, config)
 
         # Linear weights: PyTorch (out, in) -> Flax (in, out)
@@ -180,7 +180,6 @@ def main():
     # Determine paths
     model_path = None
     config_path = None
-    state_dict = None
     
     if args.local_path:
         if os.path.exists(os.path.join(args.local_path, "model.safetensors")):
@@ -196,16 +195,13 @@ def main():
 
     # Fallback to Hub if local not found or not provided
     if model_path is None:
-        print(f"Downloading weights (in-memory) from {args.repo_id}...")
-        weights_bytes = hf_read_bytes(args.repo_id, "model.safetensors", revision=args.revision)
-        state_dict = load_safetensors(weights_bytes)
-        del weights_bytes
+        print(f"Downloading weights via HF cache from {args.repo_id}...")
+        model_path = cached_file(args.repo_id, "model.safetensors", revision=args.revision)
     else:
         print(f"Loading weights from local path: {model_path}")
 
-    if state_dict is None:
-        print(f"Loaded {model_path}")
-        state_dict = load_file(model_path)
+    print(f"Loaded {model_path}")
+    state_dict = load_file(model_path)
 
     # Initialize NNX Model
     print("Initializing NNX Model...")
@@ -217,9 +213,8 @@ def main():
             config_dict = json.load(f)
         config = GlmAsrConfig(**config_dict)
     else:
-        print(f"Downloading config (in-memory) from {args.repo_id}...")
-        config_dict = hf_read_json(args.repo_id, "config.json", revision=args.revision)
-        config = GlmAsrConfig(**config_dict)
+        print(f"Downloading config via HF cache from {args.repo_id}...")
+        config = GlmAsrConfig.from_pretrained(args.repo_id, revision=args.revision)
     
     rngs = nnx.Rngs(0)
     model = GlmAsrForConditionalGeneration(config, rngs=rngs)
@@ -237,13 +232,8 @@ def main():
     new_state = convert_pytorch_state_dict_to_nnx_state_dict(state_dict, config, verbose=True)
         
     print(f"Converted {len(new_state)} weights")
-    
-    print("Saving Flax model...")
-    import pickle
-    with open("model_flax.pkl", "wb") as f:
-        pickle.dump(new_state, f)
-    
-    print("Done. Verification recommended.")
+
+    print("Done. (No .pkl is written.)")
 
 
 if __name__ == "__main__":

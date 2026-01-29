@@ -1,6 +1,5 @@
 
 import os
-import pickle
 import json
 import argparse
 import jax
@@ -21,7 +20,6 @@ from transformers import WhisperFeatureExtractor, AutoTokenizer, PreTrainedToken
 from transformers.utils.hub import cached_file
 
 from convert_glmasr_weights_to_nnx import convert_pytorch_state_dict_to_nnx_state_dict
-from hf_in_memory import hf_read_bytes, hf_read_json
 
 def load_audio(audio_path, sampling_rate=16000):
     speech, _ = librosa.load(audio_path, sr=sampling_rate)
@@ -147,9 +145,9 @@ def shard_model(model, mesh, state_dict=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio_path", type=str, default="test_audio/test3.mp3")
-    parser.add_argument("--weights_path", type=str, default=None, help="Optional local .pkl/.safetensors weights path. If omitted, load from HF in-memory.")
-    parser.add_argument("--config_path", type=str, default=None, help="Optional local config.json path. If omitted, load from HF in-memory.")
-    parser.add_argument("--tokenizer_path", type=str, default=None, help="Optional local tokenizer directory. If omitted, load from HF (may use HF cache).")
+    parser.add_argument("--weights_path", type=str, default=None, help="Optional local .safetensors weights path. If omitted, download via HF cache.")
+    parser.add_argument("--config_path", type=str, default=None, help="Optional local config.json path. If omitted, download via HF cache.")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Optional local tokenizer directory. If omitted, load from HF (uses HF cache).")
     parser.add_argument("--model_id", type=str, default="zai-org/GLM-ASR-Nano-2512")
     parser.add_argument("--revision", type=str, default=None)
     args = parser.parse_args()
@@ -170,8 +168,7 @@ def main():
             config_dict = json.load(f)
         config = GlmAsrConfig(**config_dict)
     else:
-        config_dict = hf_read_json(args.model_id, "config.json", revision=args.revision)
-        config = GlmAsrConfig(**config_dict)
+        config = GlmAsrConfig.from_pretrained(args.model_id, revision=args.revision)
     
     # Model Init (on CPU/default first)
     rngs = nnx.Rngs(0)
@@ -180,14 +177,10 @@ def main():
     # Init Cache (so it exists for sharding)
     model.init_cache(1, 2048)
     
-    # Load Weights for Sharding (NNX pickle if available; otherwise download from HF and convert)
+    # Load weights for sharding (local .safetensors or download via HF cache, then convert)
     state_dict = None
     if args.weights_path and os.path.exists(args.weights_path):
-        if args.weights_path.endswith(".pkl"):
-            print(f"Loading NNX weights from {args.weights_path}...")
-            with open(args.weights_path, "rb") as f:
-                state_dict = pickle.load(f)
-        elif args.weights_path.endswith(".safetensors"):
+        if args.weights_path.endswith(".safetensors"):
             from safetensors.torch import load_file
 
             print(f"Loading safetensors weights from {args.weights_path}...")
@@ -197,19 +190,13 @@ def main():
         else:
             raise ValueError(f"Unsupported --weights_path format: {args.weights_path}")
     else:
-        from safetensors.torch import load as load_safetensors
+        from safetensors.torch import load_file
 
-        print(f"Downloading weights (in-memory) from {args.model_id}...")
-        weights_bytes = hf_read_bytes(args.model_id, "model.safetensors", revision=args.revision)
-        pt_state_dict = load_safetensors(weights_bytes)
-        del weights_bytes
+        print(f"Downloading weights via HF cache from {args.model_id}...")
+        model_path = cached_file(args.model_id, "model.safetensors", revision=args.revision)
+        pt_state_dict = load_file(model_path)
         print("Converting weights to NNX format...")
         state_dict = convert_pytorch_state_dict_to_nnx_state_dict(pt_state_dict, config, verbose=True)
-
-        if args.weights_path and args.weights_path.endswith(".pkl"):
-            print(f"Saving converted NNX weights to {args.weights_path}...")
-            with open(args.weights_path, "wb") as f:
-                pickle.dump(state_dict, f)
         
     # Shard Everything
     shard_model(model, mesh, state_dict)
@@ -221,7 +208,7 @@ def main():
     tokenizer = load_tokenizer(tokenizer_source, args.revision)
 
     chat_template = getattr(tokenizer, "chat_template", None)
-    if chat_template is None:
+    if not chat_template:
         try:
             chat_template_file = cached_file(tokenizer_source, "chat_template.jinja", revision=args.revision)
             with open(chat_template_file, "r") as f:
@@ -233,7 +220,27 @@ def main():
 
     audio = load_audio(args.audio_path)
     user_prompt = "Please transcribe this audio into text"
-    text_input = f"<|user|>\n{user_prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
+    if chat_template:
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": ""},
+                        {"type": "text", "text": user_prompt},
+                    ],
+                }
+            ]
+            text_input = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                chat_template=chat_template,
+            )
+        except Exception:
+            text_input = f"<|user|>\n{user_prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
+    else:
+        text_input = f"<|user|>\n{user_prompt}<|begin_of_audio|><|pad|><|end_of_audio|><|assistant|>"
     full_inputs = processor(text=text_input, audio=audio, sampling_rate=16000, return_tensors="pt")
     
     input_ids = jnp.array(full_inputs["input_ids"].numpy())
@@ -277,7 +284,7 @@ def main():
         if i % 10 == 0: print(f"\rStep {i}", end="", flush=True)
 
     print("\nResult:")
-    print(processor.batch_decode([generated_ids], skip_special_tokens=True)[0])
+    print(processor.batch_decode([generated_ids], skip_special_tokens=True, strip_prefix=True)[0])
 
 if __name__ == "__main__":
     main()
