@@ -21,6 +21,7 @@ from transformers import WhisperFeatureExtractor, AutoTokenizer, PreTrainedToken
 from transformers.utils.hub import cached_file
 
 from convert_glmasr_weights_to_nnx import convert_pytorch_state_dict_to_nnx_state_dict
+from hf_in_memory import hf_read_bytes, hf_read_json
 
 def load_audio(audio_path, sampling_rate=16000):
     speech, _ = librosa.load(audio_path, sr=sampling_rate)
@@ -146,9 +147,9 @@ def shard_model(model, mesh, state_dict=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio_path", type=str, default="test_audio/test3.mp3")
-    parser.add_argument("--weights_path", type=str, default="model_flax.pkl")
-    parser.add_argument("--config_path", type=str, default="weights_and_config/config.json")
-    parser.add_argument("--tokenizer_path", type=str, default="weights_and_config")
+    parser.add_argument("--weights_path", type=str, default=None, help="Optional local .pkl/.safetensors weights path. If omitted, load from HF in-memory.")
+    parser.add_argument("--config_path", type=str, default=None, help="Optional local config.json path. If omitted, load from HF in-memory.")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Optional local tokenizer directory. If omitted, load from HF (may use HF cache).")
     parser.add_argument("--model_id", type=str, default="zai-org/GLM-ASR-Nano-2512")
     parser.add_argument("--revision", type=str, default=None)
     args = parser.parse_args()
@@ -169,7 +170,8 @@ def main():
             config_dict = json.load(f)
         config = GlmAsrConfig(**config_dict)
     else:
-        config = GlmAsrConfig.from_pretrained(args.model_id, revision=args.revision)
+        config_dict = hf_read_json(args.model_id, "config.json", revision=args.revision)
+        config = GlmAsrConfig(**config_dict)
     
     # Model Init (on CPU/default first)
     rngs = nnx.Rngs(0)
@@ -180,16 +182,27 @@ def main():
     
     # Load Weights for Sharding (NNX pickle if available; otherwise download from HF and convert)
     state_dict = None
-    if args.weights_path and os.path.exists(args.weights_path) and args.weights_path.endswith(".pkl"):
-        print(f"Loading NNX weights from {args.weights_path}...")
-        with open(args.weights_path, "rb") as f:
-            state_dict = pickle.load(f)
-    else:
-        from safetensors.torch import load_file
+    if args.weights_path and os.path.exists(args.weights_path):
+        if args.weights_path.endswith(".pkl"):
+            print(f"Loading NNX weights from {args.weights_path}...")
+            with open(args.weights_path, "rb") as f:
+                state_dict = pickle.load(f)
+        elif args.weights_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
 
-        print(f"Downloading weights from {args.model_id}...")
-        model_path = cached_file(args.model_id, "model.safetensors", revision=args.revision)
-        pt_state_dict = load_file(model_path)
+            print(f"Loading safetensors weights from {args.weights_path}...")
+            pt_state_dict = load_file(args.weights_path)
+            print("Converting weights to NNX format...")
+            state_dict = convert_pytorch_state_dict_to_nnx_state_dict(pt_state_dict, config, verbose=True)
+        else:
+            raise ValueError(f"Unsupported --weights_path format: {args.weights_path}")
+    else:
+        from safetensors.torch import load as load_safetensors
+
+        print(f"Downloading weights (in-memory) from {args.model_id}...")
+        weights_bytes = hf_read_bytes(args.model_id, "model.safetensors", revision=args.revision)
+        pt_state_dict = load_safetensors(weights_bytes)
+        del weights_bytes
         print("Converting weights to NNX format...")
         state_dict = convert_pytorch_state_dict_to_nnx_state_dict(pt_state_dict, config, verbose=True)
 

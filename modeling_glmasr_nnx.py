@@ -348,6 +348,7 @@ class GlmAsrForConditionalGeneration(nnx.Module):
         input_ids: jax.Array,
         input_features: Optional[jax.Array] = None,
         input_features_mask: Optional[jax.Array] = None,
+        attention_mask: Optional[jax.Array] = None,
         deterministic: bool = True,
         rngs: Optional[nnx.Rngs] = None,
         cache_index: Optional[jax.Array] = None,
@@ -371,7 +372,11 @@ class GlmAsrForConditionalGeneration(nnx.Module):
 
             inputs_embeds = jax.vmap(combine_single)(input_ids, inputs_embeds, audio_embeds, post_lengths)
 
-        return self.language_model(inputs_embeds=inputs_embeds, cache_index=cache_index)
+        return self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_index=cache_index,
+        )
 
 
 class LlamaRMSNorm(nnx.Module):

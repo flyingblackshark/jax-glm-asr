@@ -7,12 +7,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from safetensors.torch import load as load_safetensors
 from safetensors.torch import load_file
 from flax import nnx
 
 from configuration_glmasr import GlmAsrConfig
 from modeling_glmasr_nnx import GlmAsrForConditionalGeneration
-from transformers.utils.hub import cached_file
+from hf_in_memory import hf_read_bytes, hf_read_json
 
 # Mapping from original PyTorch GLM-ASR (from HF Hub) to our Flax NNX implementation
 
@@ -179,6 +180,7 @@ def main():
     # Determine paths
     model_path = None
     config_path = None
+    state_dict = None
     
     if args.local_path:
         if os.path.exists(os.path.join(args.local_path, "model.safetensors")):
@@ -194,13 +196,16 @@ def main():
 
     # Fallback to Hub if local not found or not provided
     if model_path is None:
-        print(f"Downloading from {args.repo_id}...")
-        model_path = cached_file(args.repo_id, "model.safetensors", revision=args.revision)
+        print(f"Downloading weights (in-memory) from {args.repo_id}...")
+        weights_bytes = hf_read_bytes(args.repo_id, "model.safetensors", revision=args.revision)
+        state_dict = load_safetensors(weights_bytes)
+        del weights_bytes
     else:
         print(f"Loading weights from local path: {model_path}")
 
-    print(f"Loaded {model_path}")
-    state_dict = load_file(model_path)
+    if state_dict is None:
+        print(f"Loaded {model_path}")
+        state_dict = load_file(model_path)
 
     # Initialize NNX Model
     print("Initializing NNX Model...")
@@ -212,8 +217,9 @@ def main():
             config_dict = json.load(f)
         config = GlmAsrConfig(**config_dict)
     else:
-        print(f"Downloading config from {args.repo_id}...")
-        config = GlmAsrConfig.from_pretrained(args.repo_id, revision=args.revision)
+        print(f"Downloading config (in-memory) from {args.repo_id}...")
+        config_dict = hf_read_json(args.repo_id, "config.json", revision=args.revision)
+        config = GlmAsrConfig(**config_dict)
     
     rngs = nnx.Rngs(0)
     model = GlmAsrForConditionalGeneration(config, rngs=rngs)

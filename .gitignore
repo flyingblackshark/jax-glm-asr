@@ -2,3 +2,7 @@ weights_and_config
 model_flax.pkl
 test_audio
 __pycache__
+test.mp3
+__pycache__/*
+*.cpython
+*.pyc
