@@ -17,11 +17,62 @@ except ImportError:
 from configuration_glmasr import GlmAsrConfig
 from modeling_glmasr_nnx import GlmAsrForConditionalGeneration
 from processing_glmasr import GlmAsrProcessor
-from transformers import WhisperFeatureExtractor, AutoTokenizer
+from transformers import WhisperFeatureExtractor, AutoTokenizer, PreTrainedTokenizerFast
+from transformers.utils.hub import cached_file
+
+from convert_glmasr_weights_to_nnx import convert_pytorch_state_dict_to_nnx_state_dict
 
 def load_audio(audio_path, sampling_rate=16000):
     speech, _ = librosa.load(audio_path, sr=sampling_rate)
     return speech
+
+def load_tokenizer(tokenizer_source, revision):
+    try:
+        return AutoTokenizer.from_pretrained(tokenizer_source, revision=revision, trust_remote_code=True)
+    except ValueError as e:
+        # GLM-ASR tokenizer_config.json may set tokenizer_class="TokenizersBackend" which older transformers
+        # doesn't resolve via AutoTokenizer. Fallback to a generic fast tokenizer from tokenizer.json.
+        if "TokenizersBackend" not in str(e):
+            raise
+
+    tokenizer_file = cached_file(tokenizer_source, "tokenizer.json", revision=revision)
+    tokenizer_config_file = cached_file(tokenizer_source, "tokenizer_config.json", revision=revision)
+    with open(tokenizer_config_file, "r") as f:
+        tok_cfg = json.load(f)
+
+    init_kwargs = {}
+    for k in ("bos_token", "eos_token", "unk_token", "pad_token", "mask_token"):
+        if k in tok_cfg:
+            init_kwargs[k] = tok_cfg[k]
+    if "padding_side" in tok_cfg:
+        init_kwargs["padding_side"] = tok_cfg["padding_side"]
+    if "model_max_length" in tok_cfg:
+        init_kwargs["model_max_length"] = tok_cfg["model_max_length"]
+    if "clean_up_tokenization_spaces" in tok_cfg:
+        init_kwargs["clean_up_tokenization_spaces"] = tok_cfg["clean_up_tokenization_spaces"]
+    if "extra_special_tokens" in tok_cfg:
+        init_kwargs["additional_special_tokens"] = tok_cfg["extra_special_tokens"]
+
+    return PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, **init_kwargs)
+
+def load_feature_extractor(model_id, revision):
+    try:
+        return WhisperFeatureExtractor.from_pretrained(model_id, revision=revision)
+    except Exception:
+        pass
+
+    try:
+        processor_config_file = cached_file(model_id, "processor_config.json", revision=revision)
+        with open(processor_config_file, "r") as f:
+            processor_cfg = json.load(f)
+        fe_cfg = dict(processor_cfg.get("feature_extractor", {}))
+        fe_cfg.pop("feature_extractor_type", None)
+        if fe_cfg:
+            return WhisperFeatureExtractor(**fe_cfg)
+    except Exception:
+        pass
+
+    return WhisperFeatureExtractor(feature_size=128, sampling_rate=16000, padding_value=0.0)
 
 def get_tp_spec(key_tuple):
     key_str = ".".join(str(k) for k in key_tuple)
@@ -98,6 +149,8 @@ def main():
     parser.add_argument("--weights_path", type=str, default="model_flax.pkl")
     parser.add_argument("--config_path", type=str, default="weights_and_config/config.json")
     parser.add_argument("--tokenizer_path", type=str, default="weights_and_config")
+    parser.add_argument("--model_id", type=str, default="zai-org/GLM-ASR-Nano-2512")
+    parser.add_argument("--revision", type=str, default=None)
     args = parser.parse_args()
 
     # Mesh
@@ -111,9 +164,12 @@ def main():
     print(f"Mesh: {mesh}")
 
     # Config
-    with open(args.config_path, "r") as f:
-        config_dict = json.load(f)
-    config = GlmAsrConfig(**config_dict)
+    if args.config_path and os.path.exists(args.config_path):
+        with open(args.config_path, "r") as f:
+            config_dict = json.load(f)
+        config = GlmAsrConfig(**config_dict)
+    else:
+        config = GlmAsrConfig.from_pretrained(args.model_id, revision=args.revision)
     
     # Model Init (on CPU/default first)
     rngs = nnx.Rngs(0)
@@ -122,22 +178,44 @@ def main():
     # Init Cache (so it exists for sharding)
     model.init_cache(1, 2048)
     
-    # Load Weights for Sharding
-    print(f"Loading weights from {args.weights_path}...")
-    with open(args.weights_path, "rb") as f:
-        state_dict = pickle.load(f)
+    # Load Weights for Sharding (NNX pickle if available; otherwise download from HF and convert)
+    state_dict = None
+    if args.weights_path and os.path.exists(args.weights_path) and args.weights_path.endswith(".pkl"):
+        print(f"Loading NNX weights from {args.weights_path}...")
+        with open(args.weights_path, "rb") as f:
+            state_dict = pickle.load(f)
+    else:
+        from safetensors.torch import load_file
+
+        print(f"Downloading weights from {args.model_id}...")
+        model_path = cached_file(args.model_id, "model.safetensors", revision=args.revision)
+        pt_state_dict = load_file(model_path)
+        print("Converting weights to NNX format...")
+        state_dict = convert_pytorch_state_dict_to_nnx_state_dict(pt_state_dict, config, verbose=True)
+
+        if args.weights_path and args.weights_path.endswith(".pkl"):
+            print(f"Saving converted NNX weights to {args.weights_path}...")
+            with open(args.weights_path, "wb") as f:
+                pickle.dump(state_dict, f)
         
     # Shard Everything
     shard_model(model, mesh, state_dict)
     
     # Processor & Inference
-    feature_extractor = WhisperFeatureExtractor(feature_size=128, sampling_rate=16000, padding_value=0.0)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-    chat_template_path = os.path.join(args.tokenizer_path, "chat_template.jinja")
-    chat_template = None
-    if os.path.exists(chat_template_path):
-        with open(chat_template_path, "r") as f:
-            chat_template = f.read()
+    feature_extractor = load_feature_extractor(args.model_id, args.revision)
+
+    tokenizer_source = args.tokenizer_path if args.tokenizer_path and os.path.exists(args.tokenizer_path) else args.model_id
+    tokenizer = load_tokenizer(tokenizer_source, args.revision)
+
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if chat_template is None:
+        try:
+            chat_template_file = cached_file(tokenizer_source, "chat_template.jinja", revision=args.revision)
+            with open(chat_template_file, "r") as f:
+                chat_template = f.read()
+        except Exception:
+            chat_template = None
+
     processor = GlmAsrProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer, chat_template=chat_template)
 
     audio = load_audio(args.audio_path)

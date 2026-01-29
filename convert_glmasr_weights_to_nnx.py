@@ -127,6 +127,48 @@ def permute_rope_torch(tensor, config):
 
     return tensor
 
+def key_str_to_nnx_tuple_path(key_str: str) -> tuple:
+    parts = []
+    for part in key_str.split("."):
+        if "[" in part and "]" in part:
+            name, idx = part.split("[")
+            idx = int(idx[:-1])
+            parts.append(name)
+            parts.append(idx)
+        else:
+            parts.append(part)
+    return tuple(parts)
+
+def convert_pytorch_state_dict_to_nnx_state_dict(state_dict, config, *, verbose: bool = False):
+    new_state = {}
+    for k, v in state_dict.items():
+        new_key_str = convert_key(k, MAPPING)
+        if new_key_str is None:
+            continue
+
+        # RoPE permutation for Audio Tower (apply before transpose)
+        if "audio_encoder.whisper" in k and ("q_proj" in k or "k_proj" in k):
+            v = permute_rope_torch(v, config)
+
+        # Linear weights: PyTorch (out, in) -> Flax (in, out)
+        if "kernel" in new_key_str and v.dim() == 2:
+            v = v.t()
+
+        # Conv weights: PyTorch (out, in, k) -> Flax (k, in, out)
+        if "conv" in new_key_str and "kernel" in new_key_str and v.dim() == 3:
+            v = v.permute(2, 1, 0)
+
+        if v.dtype == torch.bfloat16:
+            v = v.float()
+
+        key_tuple = key_str_to_nnx_tuple_path(new_key_str)
+        new_state[key_tuple] = jnp.array(v.detach().cpu().numpy())
+
+        if verbose and len(new_state) <= 5:
+            print(f"{k} -> {new_key_str} ({tuple(new_state[key_tuple].shape)})")
+
+    return new_state
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo_id", type=str, default="zai-org/GLM-ASR-Nano-2512")
@@ -165,20 +207,13 @@ def main():
     
     if config_path:
         print(f"Loading config from {config_path}")
-        # Assuming we can instantiate config from local dict/file if needed, 
-        # or assuming the class handles kwargs if we load JSON manually.
-        # Ideally, PretrainedConfig has from_pretrained/from_json_file but our class local instantiation might vary.
-        # Let's use standard loading if possible or json.load.
         import json
         with open(config_path, "r") as f:
             config_dict = json.load(f)
-        # We need to handle nested configs potentially, but GlmAsrConfig init handles kwargs.
-        # However, it expects 'audio_config' and 'text_config' which might be dicts or AutoConfig objects.
-        # Our `__init__` handles dicts.
         config = GlmAsrConfig(**config_dict)
     else:
-        print("Using default config (Warning: might differ from checkpoints)")
-        config = GlmAsrConfig() 
+        print(f"Downloading config from {args.repo_id}...")
+        config = GlmAsrConfig.from_pretrained(args.repo_id, revision=args.revision)
     
     rngs = nnx.Rngs(0)
     model = GlmAsrForConditionalGeneration(config, rngs=rngs)
@@ -192,101 +227,8 @@ def main():
     graph_state = nnx.state(model)
     flat_state = graph_state.flat_state()
     
-    new_state = {}
-    
     print("Converting weights...")
-    count = 0
-    for k, v in state_dict.items():
-        if count < 5:
-            print(f"Processing key: {k}")
-            
-        # k is PyTorch key, v is Tensor
-        # 1. Convert key
-        new_key_str = convert_key(k, MAPPING)
-        
-        if new_key_str is None:
-            if count < 5:
-                print(f"  -> NO MATCH")
-            # Check if it was explicitly ignored or just not mapped
-            if "audio_bos_eos" not in k and "embed_positions" not in k and "bias" not in k: # filter audio tower biases if handled
-                 pass
-                 # print(f"Skipping key (no map): {k}")
-            if count < 5: count += 1
-            continue
-        
-        if count < 5:
-            print(f"  -> MATCH: {new_key_str}")
-            count += 1
-            
-        # 2. Process Value
-        # Handle Transpose for Kernels (Linear layers)
-        if "kernel" in new_key_str:
-            if v.dim() == 2:
-                # PyTorch Linear is (out, in), Flax is (in, out)
-                v = v.t()
-        
-        # Handle RoPE permutation for Audio Tower
-        if "audio_encoder.whisper" in k and ("q_proj" in k or "k_proj" in k):
-             # We need to un-permute or permute? 
-             # The original script permutes RoPE. NNX implementation expects standard?
-             # If our NNX RoPE is standard, and the weights are weirdly permuted, we need to fix.
-             # The reference script says "original checkpoint applies partial rope ... interleaved".
-             # Our NNX RoPE implementation (rotation_half) expects standard [x1, x2, ...] pairs? 
-             # Or [-x2, x1]?
-             # Let's trust the logic in `permute_rope` from the reference script fixes it for standard consumption.
-             v = permute_rope_torch(v, config)
-             
-             # If it was a kernel, we transposed it above. 
-             # Note: logic sequence. 
-             # `v.t()` happens first if we detect 'kernel'. 
-             # `permute_rope` assumes (out, in) or (dim). 
-             # If we transposed, it is (in, out). 
-             # `permute_rope` usually operates on the head dimension which is part of 'out'.
-             # If v is (in, out), dim0 is in, dim1 is out.
-             # permute_rope checks dim0.
-             # Valid logic: 
-             # 1. Permute (fix RoPE structure) on original (out, in)
-             # 2. Transpose to (in, out) for Flax
-             
-             # Re-doing order:
-             # Reset v from state_dict
-             v = state_dict[k]
-             v = permute_rope_torch(v, config)
-             if "kernel" in new_key_str and v.dim() == 2:
-                 v = v.t()
-
-        # Handle Conv (Conv1d)
-        # PyTorch Conv1d: (out, in, kernel)
-        # Flax Conv: (kernel, in, out)
-        if "conv" in new_key_str and "kernel" in new_key_str:
-             if v.dim() == 3:
-                 # (out, in, k) -> (k, in, out)
-                 v = v.permute(2, 1, 0)
-        
-        # Convert to numpy/JAX
-        # Handle BFloat16 which numpy doesn't support directly from torch
-        if v.dtype == torch.bfloat16:
-            v = v.float() # Cast to float32
-            
-        v_np = v.detach().cpu().numpy()
-        
-        # Convert dot-notation string to tuple path used by NNX
-        # e.g. "language_model.model.layers.layers[0].self_attn" -> ('language_model', 'model', 'layers', 'layers', 0, 'self_attn')
-        parts = []
-        for p in new_key_str.split('.'):
-            if '[' in p and ']' in p:
-                # layers[0] -> layers, 0
-                name, idx = p.split('[')
-                idx = int(idx[:-1])
-                parts.append(name)
-                parts.append(idx)
-            else:
-                parts.append(p)
-        
-        key_tuple = tuple(parts)
-        
-        # Store in new_state
-        new_state[key_tuple] = jnp.array(v_np)
+    new_state = convert_pytorch_state_dict_to_nnx_state_dict(state_dict, config, verbose=True)
         
     print(f"Converted {len(new_state)} weights")
     
